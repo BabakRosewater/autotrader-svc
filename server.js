@@ -5,9 +5,10 @@ import { chromium } from "playwright";
 const app = express();
 app.use(cors());
 
-const CARD_SEL =
-  '[data-cmp="inventory-listing"], article[data-cmp*="inventory"], article:has([data-cmp="inventoryListingTitle"])';
-const BASE = "https://www.autotrader.com/cars-for-sale/kalispell-mt";
+// Wait on link anchors; they’re the most stable thing across layouts
+const LINK_SEL = 'a[href*="/cars-for-sale/vehicle"]';
+// Use the generic endpoint; zip/radius drive the results
+const BASE = "https://www.autotrader.com/cars-for-sale/all-cars";
 
 // ---------- helpers ----------
 function buildUrl({ zip, radius, priceMax, drive }) {
@@ -42,47 +43,66 @@ async function acceptCookies(page) {
   }
 }
 
-async function ensureResults(page, selector, attempts = 25) {
-  // drive lazy-load by scrolling
+async function pollForLinks(page, attempts = 60) {
   for (let i = 0; i < attempts; i++) {
-    const count = (await page.$$(selector)).length;
-    if (count > 0) return true;
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1200);
+    const n = (await page.$$(LINK_SEL)).length;
+    if (n > 0) return true;
+    // nudge lazy load
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
+    await page.waitForTimeout(900);
   }
   return false;
 }
 
-async function extractCard(card, sourceUrl) {
-  const getText = async (sel) => {
-    const el = await card.$(sel);
-    return el ? (await el.textContent())?.trim() : null;
-  };
+async function extractFromLink(page, aHandle, sourceUrl) {
+  // find the nearest “card” root
+  const root = await aHandle.evaluateHandle((el) => {
+    return (
+      el.closest("article") ||
+      el.closest('[data-cmp*="inventory"]') ||
+      el.closest("li") ||
+      el.parentElement
+    );
+  });
 
-  const sponsored = !!(await card.$(':text("Sponsored"), :text("Sponsored by")'));
+  async function pickText(sel) {
+    const el = await root.asElement().$(sel);
+    return el ? (await el.textContent())?.trim() : null;
+  }
+
+  // fields (defensively try several selectors)
   const title =
-    (await getText('[data-cmp="inventoryListingTitle"]')) ||
-    (await getText("h3")) ||
-    (await getText("h2"));
-  const price_raw = await getText('[data-cmp="pricing"] :text("$"), :text("$")');
+    (await pickText('[data-cmp="inventoryListingTitle"]')) ||
+    (await pickText("h3")) ||
+    (await pickText("h2")) ||
+    (await pickText('[data-cmp*="title"]'));
+
+  const price_raw =
+    (await pickText('[data-cmp="pricing"] :text("$")')) ||
+    (await pickText(':text("$")'));
+
   const mileage_raw =
-    (await getText(':text("mi.")')) || (await getText(':text(" miles")'));
+    (await pickText(':text(" mi"), :text("mi.)"), :text("miles")')) ||
+    (await pickText('[data-cmp*="mileage"]'));
+
   const dealer =
-    (await getText('[data-cmp="dealerName"]')) ||
-    (await getText('[data-cmp="seller-name"]')) ||
-    (await getText(".dealer-name"));
-  const deal_badge = await getText(
+    (await pickText('[data-cmp="dealerName"]')) ||
+    (await pickText('[data-cmp="seller-name"]')) ||
+    (await pickText(".dealer-name"));
+
+  const deal_badge = await pickText(
     ':text("Great Price"), :text("Good Price"), :text("Fair Price")'
   );
 
-  let link = null;
-  const a = await card.$('a[href*="/cars-for-sale/vehicle"]');
-  if (a) {
-    link = await a.getAttribute("href");
-    if (link?.startsWith("/")) link = "https://www.autotrader.com" + link;
-  }
+  // anchor href
+  let link = await aHandle.getAttribute("href");
+  if (link?.startsWith("/")) link = "https://www.autotrader.com" + link;
 
-  let year = null, make = null, model = null, trim = null;
+  // parse year/make/model/trim from title if present
+  let year = null,
+    make = null,
+    model = null,
+    trim = null;
   if (title) {
     const parts = title.split(/\s+/);
     if (/^\d{4}$/.test(parts[0])) {
@@ -95,15 +115,23 @@ async function extractCard(card, sourceUrl) {
 
   return {
     source_url: sourceUrl,
-    title, year, make, model, trim,
-    price_raw, price_num: cleanNum(price_raw),
-    mileage_raw, mileage_num: cleanNum(mileage_raw),
-    dealer, deal_badge, sponsored, link
+    title,
+    year,
+    make,
+    model,
+    trim,
+    price_raw,
+    price_num: cleanNum(price_raw),
+    mileage_raw,
+    mileage_num: cleanNum(mileage_raw),
+    dealer,
+    deal_badge,
+    sponsored: false, // if we don’t find a badge we treat it as organic
+    link,
   };
 }
 
 async function scrape(url, cap = 800) {
-  // sandbox-friendly launch flags
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -116,48 +144,41 @@ async function scrape(url, cap = 800) {
   });
 
   const ctx = await browser.newContext({
+    // make it look like a normal US desktop
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1366, height: 1800 },
+    locale: "en-US",
   });
   const page = await ctx.newPage();
 
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // handle consent & settle
   await acceptCookies(page);
   await page.waitForLoadState("networkidle").catch(() => {});
 
-  // wait for any card to be ATTACHED (not necessarily visible)
-  const attached = await page
-    .waitForSelector(CARD_SEL, { state: "attached", timeout: 45000 })
+  // Wait for at least one vehicle link to attach
+  const firstLink = await page
+    .waitForSelector(LINK_SEL, { state: "attached", timeout: 45000 })
     .catch(() => null);
 
-  if (!attached) {
-    const ok = await ensureResults(page, CARD_SEL, 25);
-    if (!ok) throw new Error("No inventory cards attached after scrolling.");
+  if (!firstLink) {
+    const ok = await pollForLinks(page, 60);
+    if (!ok) throw new Error("No vehicle links attached after scrolling.");
   }
 
-  // try to expand results (See More Results or scroll)
-  for (let i = 0; i < 30; i++) {
-    const btn = await page.$('button:has-text("See More Results")');
-    if (btn) {
-      await btn.click().catch(() => {});
-      await page.waitForTimeout(900 + Math.floor(Math.random() * 400));
-    } else {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(900);
-    }
-    const count = (await page.$$(CARD_SEL)).length;
+  // Load more results (scrolling is enough; “See More” isn’t always present)
+  for (let i = 0; i < 50; i++) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(700 + Math.floor(Math.random() * 400));
+    const count = (await page.$$(LINK_SEL)).length;
     if (count >= cap) break;
   }
 
-  // extract
-  const cards = await page.$$(CARD_SEL);
+  const links = await page.$$(LINK_SEL);
   const out = [];
-  for (const c of cards) {
-    const row = await extractCard(c, url);
-    if (!row.sponsored) out.push(row);
+  for (const a of links) {
+    const row = await extractFromLink(page, a, url);
+    out.push(row);
     if (out.length >= cap) break;
   }
 
@@ -177,7 +198,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
-// no homepage route; show a friendly hint instead of "Cannot GET /"
+// Friendly hint on /
 app.get("/", (_req, res) => {
   res.status(200).send('OK. Try <code>/search?zip=59901&radius=10</code>');
 });

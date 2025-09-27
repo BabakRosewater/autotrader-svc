@@ -5,9 +5,7 @@ import { chromium } from "playwright";
 const app = express();
 app.use(cors());
 
-// Wait on link anchors; they’re the most stable thing across layouts
 const LINK_SEL = 'a[href*="/cars-for-sale/vehicle"]';
-// Use the generic endpoint; zip/radius drive the results
 const BASE = "https://www.autotrader.com/cars-for-sale/all-cars";
 
 // ---------- helpers ----------
@@ -38,23 +36,29 @@ async function clickIfExists(page, text) {
 }
 
 async function acceptCookies(page) {
+  // common consent buttons
   for (const t of ["Accept All", "Accept all", "I Agree", "Got it", "Accept"]) {
     if (await clickIfExists(page, t)) break;
   }
 }
 
-async function pollForLinks(page, attempts = 60) {
+async function looksBlocked(page) {
+  const sel = 'text=/verify you are a human|Access Denied|unusual traffic/i';
+  const el = await page.$(sel);
+  return !!el;
+}
+
+async function pollForLinks(page, attempts = 80) {
   for (let i = 0; i < attempts; i++) {
     const n = (await page.$$(LINK_SEL)).length;
     if (n > 0) return true;
-    // nudge lazy load
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.95));
     await page.waitForTimeout(900);
   }
   return false;
 }
 
-async function extractFromLink(page, aHandle, sourceUrl) {
+async function extractFromLink(aHandle, sourceUrl) {
   // find the nearest “card” root
   const root = await aHandle.evaluateHandle((el) => {
     return (
@@ -65,12 +69,11 @@ async function extractFromLink(page, aHandle, sourceUrl) {
     );
   });
 
-  async function pickText(sel) {
+  const pickText = async (sel) => {
     const el = await root.asElement().$(sel);
     return el ? (await el.textContent())?.trim() : null;
-  }
+  };
 
-  // fields (defensively try several selectors)
   const title =
     (await pickText('[data-cmp="inventoryListingTitle"]')) ||
     (await pickText("h3")) ||
@@ -94,39 +97,25 @@ async function extractFromLink(page, aHandle, sourceUrl) {
     ':text("Great Price"), :text("Good Price"), :text("Fair Price")'
   );
 
-  // anchor href
   let link = await aHandle.getAttribute("href");
   if (link?.startsWith("/")) link = "https://www.autotrader.com" + link;
 
-  // parse year/make/model/trim from title if present
-  let year = null,
-    make = null,
-    model = null,
-    trim = null;
+  // naive parse
+  let year = null, make = null, model = null, trim = null;
   if (title) {
     const parts = title.split(/\s+/);
     if (/^\d{4}$/.test(parts[0])) {
-      year = parts[0];
-      make = parts[1] || null;
-      model = parts[2] || null;
-      trim = parts.slice(3).join(" ") || null;
+      year = parts[0]; make = parts[1] || null; model = parts[2] || null; trim = parts.slice(3).join(" ") || null;
     }
   }
 
   return {
     source_url: sourceUrl,
-    title,
-    year,
-    make,
-    model,
-    trim,
-    price_raw,
-    price_num: cleanNum(price_raw),
-    mileage_raw,
-    mileage_num: cleanNum(mileage_raw),
-    dealer,
-    deal_badge,
-    sponsored: false, // if we don’t find a badge we treat it as organic
+    title, year, make, model, trim,
+    price_raw, price_num: cleanNum(price_raw),
+    mileage_raw, mileage_num: cleanNum(mileage_raw),
+    dealer, deal_badge,
+    sponsored: false,
     link,
   };
 }
@@ -143,31 +132,54 @@ async function scrape(url, cap = 800) {
     ],
   });
 
+  // Kalispell coordinates; set geolocation + timezone + locale
   const ctx = await browser.newContext({
-    // make it look like a normal US desktop
+    geolocation: { latitude: 48.1978, longitude: -114.3161 },
+    permissions: ["geolocation"],
+    timezoneId: "America/Denver",
+    locale: "en-US",
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     viewport: { width: 1366, height: 1800 },
-    locale: "en-US",
   });
+
+  // reduce headless fingerprints
+  await ctx.addInitScript(() => {
+    // hide webdriver
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    // mock plugins & languages a bit
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+  });
+
   const page = await ctx.newPage();
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+
+  // warm-up home (helps consent), then go to target
+  await page.goto("https://www.autotrader.com/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  await acceptCookies(page).catch(() => {});
+  await page.waitForTimeout(800);
 
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await acceptCookies(page);
   await page.waitForLoadState("networkidle").catch(() => {});
 
-  // Wait for at least one vehicle link to attach
-  const firstLink = await page
+  if (await looksBlocked(page)) {
+    throw new Error("Blocked by anti-bot/verification page.");
+  }
+
+  // Wait for any vehicle link to ATTACH, then drive lazy load
+  const attached = await page
     .waitForSelector(LINK_SEL, { state: "attached", timeout: 45000 })
     .catch(() => null);
 
-  if (!firstLink) {
-    const ok = await pollForLinks(page, 60);
+  if (!attached) {
+    const ok = await pollForLinks(page, 80);
     if (!ok) throw new Error("No vehicle links attached after scrolling.");
   }
 
-  // Load more results (scrolling is enough; “See More” isn’t always present)
-  for (let i = 0; i < 50; i++) {
+  // Load more by scrolling (button isn't always present)
+  for (let i = 0; i < 60; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(700 + Math.floor(Math.random() * 400));
     const count = (await page.$$(LINK_SEL)).length;
@@ -177,7 +189,7 @@ async function scrape(url, cap = 800) {
   const links = await page.$$(LINK_SEL);
   const out = [];
   for (const a of links) {
-    const row = await extractFromLink(page, a, url);
+    const row = await extractFromLink(a, url);
     out.push(row);
     if (out.length >= cap) break;
   }
